@@ -155,6 +155,9 @@ def visualize_opt_tree_run(
     Returns:
         dict with frame paths, gif path, html path, and counts.
     """
+    # The decoder can hand us either the final report dict, raw step_infos, or a
+    # path to saved JSON. Normalize all three into the same report shape so the
+    # renderer below only has to understand one format.
     loaded_report = _load_report(report=report, step_infos=step_infos, log_path=log_path)
     steps = loaded_report.get("steps", [])
 
@@ -184,6 +187,7 @@ def visualize_opt_tree_run(
     all_frames: List[FrameResult] = []
 
     # Use a stable canvas size across the whole run to make GIF creation clean.
+    # Without this, frames with bigger/smaller trees would visibly jump.
     max_leaf_count, global_max_depth = _estimate_global_tree_size(steps)
 
     # The decoder report stores full_text_after_step but not full_text_before_step.
@@ -286,6 +290,8 @@ def render_step_frames(
     tree = step.get("tree", {})
     verification = step.get("verification", {})
 
+    # Decoder logs are JSON-serializable dicts, while in-memory step_infos may
+    # contain dataclasses. Normalize to dicts before doing layout/highlighting.
     nodes = _normalize_nodes(tree.get("nodes", []))
     children_by_parent = _children_by_parent(nodes)
     target_choices = verification.get("target_choices", []) or []
@@ -338,6 +344,8 @@ def render_step_frames(
     )
     frames.append(FrameResult(str(path), caption, shown_step_idx, 0))
 
+    # These accumulate across target choices inside one speculative step, so
+    # frame N can show all tokens accepted in frames 1..N-1.
     accepted_so_far_ids: List[int] = []
     accepted_so_far_text = ""
 

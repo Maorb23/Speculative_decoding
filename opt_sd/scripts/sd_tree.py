@@ -20,6 +20,21 @@ Important assumptions:
     from the target distribution at each verified tree node. This preserves the
     target model distribution and avoids the linear q/p rejection-correction
     rule, because the accepted path is determined by target-model samples.
+
+Mental model:
+  1. Tokenize the existing prefix.
+  2. Ask the small model to build a tree of likely continuations. A node stores
+     one token plus a pointer to its parent, so every node represents
+     prefix + path(root -> node).
+  3. Ask the big model for next-token logits at every tree parent.
+     The fast version flattens the whole tree into one sequence and uses a 4D
+     attention mask so siblings cannot see each other. If the model cannot
+     consume that custom mask, the portable fallback verifies every parent path
+     as a padded batch.
+  4. Walk down the tree using big-model choices. Each time the big model chooses
+     a child that exists in the draft tree, accept it. When it chooses a token
+     outside the drafted children, append that target token and stop this step.
+  5. Repeat until the requested number of new tokens is generated.
 """
 
 from __future__ import annotations
@@ -95,6 +110,9 @@ def processing_inputs(
     ).to(device_type)
 
     input_ids = inputs["input_ids"][0]
+    # The main decoder keeps a 1D token vector and rebuilds masks inside each
+    # model call. Returning the original tokenizer mask is useful for debugging
+    # and backward compatibility, but the current decode loop does not consume it.
     attention_mask = inputs["attention_mask"]
 
     return input_ids, attention_mask
@@ -106,6 +124,8 @@ def processing_inputs(
 
 @dataclass
 class DraftTreeNode:
+    # A node is not a whole sequence. It is one proposed token plus enough
+    # metadata to reconstruct the sequence by following parent_id links.
     node_id: int
     token_id: int
     parent_id: int       # -1 means root/prefix
@@ -116,6 +136,8 @@ class DraftTreeNode:
 
 @dataclass
 class OPTTree:
+    # The tree is stored as a flat node list because it is easier to serialize
+    # into logs and later visualize. parent_id encodes the edges.
     nodes: List[DraftTreeNode]
     node_budget: int
     max_depth: int
@@ -284,6 +306,8 @@ def _small_model_next_probs_for_parents(
     This is a simple batched implementation; it is not the KV-cache-optimized
     version from the original repo.
     """
+    # Every parent node represents a different prefix+path. Batch those paths
+    # together so one small-model forward expands many frontier nodes at once.
     sequences = []
     for parent_id in parent_ids:
         path_tokens = _get_node_path_token_ids(nodes_by_id, parent_id)
@@ -323,6 +347,8 @@ def _select_closed_top_nodes(
         reverse=True,
     )
 
+    # "Closed" means: if we keep a node, we must also keep every ancestor.
+    # Without this, verification could point to a child whose parent was pruned.
     selected = set()
 
     for idx in ordered:
@@ -383,6 +409,8 @@ def construct_opt_tree(
         if not frontier_parent_ids:
             break
 
+        # Expand the current frontier. Depth 1 expands the root/prefix, later
+        # depths expand the most promising nodes from the previous depth.
         probs_batch = _small_model_next_probs_for_parents(
             small_model=small_model,
             tokenizer=tokenizer,
@@ -417,6 +445,9 @@ def construct_opt_tree(
                 new_ids_this_depth.append(next_node_id)
                 next_node_id += 1
 
+        # Keep only the best closed subtree under the node budget. This is the
+        # adaptive part: the tree can be wide, deep, or mixed depending on where
+        # the small model puts probability mass.
         selected_ids = _select_closed_top_nodes(
             all_nodes=all_nodes,
             candidate_ids=all_candidate_ids,
@@ -453,7 +484,8 @@ def construct_opt_tree(
             reverse=True,
         )[:node_budget]
 
-    # Re-map selected nodes to dense node ids in topological order.
+    # Re-map selected nodes to dense node ids in topological order. The
+    # visualizer and 4D attention builder assume parent ids point backward.
     final_old_ids = sorted(final_selected_ids, key=lambda idx: (all_nodes[idx].depth, idx))
     old_to_new: Dict[int, int] = {}
     final_nodes: List[DraftTreeNode] = []
@@ -508,7 +540,16 @@ def _build_tree_attention_inputs(
     tree: OPTTree,
     device_type: str,
 ):
-    """Create flat tree input ids, 4D tree attention mask, and position ids."""
+    """Create flat tree input ids, 4D tree attention mask, and position ids.
+
+    The flattened input is:
+
+        [prefix tokens..., tree node 0, tree node 1, ...]
+
+    The custom mask gives each tree node visibility into the prefix and its own
+    ancestors only. That is the key trick: it lets one target-model forward
+    compute logits for many incompatible branch paths without sibling leakage.
+    """
     prefix_len = all_ids.numel()
     num_tree_nodes = len(tree.nodes)
     total_len = prefix_len + num_tree_nodes
@@ -531,6 +572,8 @@ def _build_tree_attention_inputs(
     node_to_flat_pos = {node.node_id: prefix_len + i for i, node in enumerate(tree.nodes)}
     nodes_by_id = {node.node_id: node for node in tree.nodes}
 
+    # allowed[row, col] answers: "May token at row attend to token at col?"
+    # Prefix rows use normal causal attention; tree rows use tree-path attention.
     allowed = torch.zeros((total_len, total_len), dtype=torch.bool, device=device_type)
 
     # Normal causal attention inside the prefix.
@@ -547,7 +590,6 @@ def _build_tree_attention_inputs(
             allowed[row, node_to_flat_pos[current]] = True
             current = nodes_by_id[current].parent_id
 
-    dtype = _model_dtype(big_model)
     # Use float32 for safety. Most HF attention code accepts float additive masks.
     min_value = torch.finfo(torch.float32).min
     additive_mask = torch.zeros((1, 1, total_len, total_len), dtype=torch.float32, device=device_type)
@@ -607,6 +649,9 @@ def _big_model_batched_path_forward(
     Portable fallback: one batched target forward over prefix+path(parent) for
     root and every draft node. Correct but less efficient than 4D tree attention.
     """
+    # Fallback shape: one row for the root/prefix and one row for each node as a
+    # parent. This repeats the prefix many times, so it is memory/work heavier
+    # than 4D attention, but it uses standard 2D attention masks.
     nodes_by_id = {node.node_id: node for node in tree.nodes}
     parent_ids = [-1] + [node.node_id for node in tree.nodes]
 
@@ -660,6 +705,8 @@ def forward_target_model_on_tree(
             device_type=device_type,
         )
 
+    # Try true tree attention first. HuggingFace support varies by model and
+    # attention backend, so failure is expected on some setups and not fatal.
     if prefer_tree_attention:
         try:
             return _big_model_tree_attention_forward(
@@ -708,6 +755,8 @@ def verify_tree_and_sample_output(
     append that target token and stop. This is exact for greedy decoding and also
     preserves the target sampling distribution for do_sample=True.
     """
+    # Build quick lookup: at each parent, which drafted children are available?
+    # Verification then becomes a target-model walk through that lookup table.
     children_by_parent = _build_children_by_parent(tree)
     current_parent = -1
 
@@ -737,10 +786,14 @@ def verify_tree_and_sample_output(
         )
 
         if child is None:
+            # The target chose a token outside the draft tree at this parent.
+            # Append the target token as the "bonus" token and finish the step.
             bonus_token = target_token.reshape(1).to(device_type)
             stop_reason = "target_token_not_in_draft_children"
             break
 
+        # The target token matches a drafted child, so this draft token is safe
+        # to accept and we continue verification deeper in the tree.
         accepted_node_ids.append(child.node_id)
         accepted_token_ids.append(child.token_id)
         current_parent = child.node_id
@@ -885,6 +938,8 @@ def opt_tree_speculative_decoding_step(
     step_start = time.perf_counter()
     all_ids_before_step = all_ids.clone()
 
+    # Phase 1: draft. The small model proposes a compact tree of possible next
+    # tokens under the node budget.
     tree = construct_opt_tree(
         small_model=small_model,
         tokenizer=tokenizer,
@@ -897,6 +952,8 @@ def opt_tree_speculative_decoding_step(
         device_type=device_type,
     )
 
+    # Phase 2: verify. The big model produces next-token logits for the root and
+    # for every node as a potential parent.
     logits_by_parent, target_forward_info = forward_target_model_on_tree(
         big_model=big_model,
         tokenizer=tokenizer,
@@ -906,6 +963,8 @@ def opt_tree_speculative_decoding_step(
         prefer_tree_attention=prefer_tree_attention,
     )
 
+    # Phase 3: choose output. Walk down the tree according to big-model choices,
+    # accepting drafted tokens until the big model leaves the tree.
     verify_info = verify_tree_and_sample_output(
         tokenizer=tokenizer,
         tree=tree,
@@ -992,7 +1051,7 @@ def speculative_decode_tree(
     gamma is intentionally kept in the signature so old calls do not break, but
     OPT-Tree uses node_budget/max_depth/threshold instead of a linear gamma.
     """
-    input_ids, attention_mask = processing_inputs(
+    input_ids, _attention_mask = processing_inputs(
         tokenizer=tokenizer,
         input_text=input_text,
         device_type=device_type,
@@ -1005,6 +1064,8 @@ def speculative_decode_tree(
 
     step_index = 0
 
+    # Each loop iteration may add multiple tokens: accepted draft tokens plus
+    # one target-model bonus token. That is where speculative speedup can appear.
     while len(all_ids) - len(input_ids) < seqlen:
         remaining_tokens = seqlen - (len(all_ids) - len(input_ids))
 

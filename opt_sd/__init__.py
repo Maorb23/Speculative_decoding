@@ -1,16 +1,27 @@
-"""Early-exit speculative decoding utilities."""
+"""OPT-Tree speculative decoding utilities.
 
-from .config import EarlyExitConfig
-from .modeling import load_model_tokenizer_and_lens
-from .draft import generate_with_tuned_lens
-from .spec_decode import speculative_decode_once, speculative_generate
-from .benchmark import run_benchmark
+This package currently contains the tree-based two-model speculative decoder
+under ``opt_sd.scripts.sd_tree`` plus a report visualizer. Older early-exit
+imports used to live here, but those modules are not present in this package.
+"""
+
+from .scripts.sd_tree import (
+    construct_opt_tree,
+    forward_target_model_on_tree,
+    loading_models,
+    opt_tree_speculative_decoding_step,
+    speculative_decode_tree,
+    verify_tree_and_sample_output,
+)
+from .scripts.tree_visualizer import visualize_opt_tree_run, visualize_tree_run
 
 __all__ = [
-    "EarlyExitConfig",
-    "load_model_tokenizer_and_lens",
-    "generate_with_tuned_lens",
-    "speculative_decode_once",
-    "speculative_generate",
-    "run_benchmark",
+    "construct_opt_tree",
+    "forward_target_model_on_tree",
+    "loading_models",
+    "opt_tree_speculative_decoding_step",
+    "speculative_decode_tree",
+    "verify_tree_and_sample_output",
+    "visualize_opt_tree_run",
+    "visualize_tree_run",
 ]
