@@ -12,7 +12,7 @@ from .checkpointing import (
 from .data import build_fixed_eval_cache_from_stream
 from .evaluate import evaluate_fixed_eval_set
 from .logging_utils import (
-    add_rows_to_wandb_log,
+    add_train_metric_layer_scalars_to_wandb,
     build_eval_comparison_plots_for_wandb,
     eval_rows_from_metrics,
     metric_row,
@@ -94,6 +94,7 @@ def train_initial_adapters(
 
         wandb.define_metric("step")
         wandb.define_metric("train/*", step_metric="step")
+        wandb.define_metric("train_by_layer/*", step_metric="step")
         wandb.define_metric("eval/*", step_metric="step")
 
     eval_batches, train_iter = build_fixed_eval_cache_from_stream(
@@ -227,7 +228,17 @@ def train_initial_adapters(
                     log_record[f"layer_{layer}/train/kl_loss"] = layer_loss
 
                 if use_wandb:
-                    add_rows_to_wandb_log(wandb_log, step, "train", train_rows)
+                    add_train_metric_layer_scalars_to_wandb(
+                        wandb_log=wandb_log,
+                        rows=train_rows,
+                        metrics_to_log=[
+                            "kl_loss",
+                            "metric_kl",
+                            "ce",
+                            "top1",
+                            "accept_exact",
+                        ],
+                    )
 
             if do_eval:
                 print("-" * 80)

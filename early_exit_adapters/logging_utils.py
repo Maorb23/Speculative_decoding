@@ -103,6 +103,30 @@ def add_rows_to_wandb_log(wandb_log, step, split, rows):
     )
 
 
+def add_train_metric_layer_scalars_to_wandb(
+    wandb_log,
+    rows,
+    metrics_to_log=None,
+):
+    if metrics_to_log is None:
+        metrics_to_log = [
+            "kl_loss",
+            "metric_kl",
+            "ce",
+            "top1",
+            "accept_exact",
+        ]
+
+    for row in rows:
+        layer = row["layer"]
+
+        for metric in metrics_to_log:
+            value = row.get(metric)
+            if value is None:
+                continue
+            wandb_log[f"train_by_layer/{metric}/layer_{layer:02d}"] = value
+
+
 def eval_rows_from_metrics(eval_metrics, candidate_layers, top_k):
     baseline_rows = []
     adapted_rows = []
