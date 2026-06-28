@@ -143,32 +143,118 @@ def generate_draft_tokens(
     Fallback path:
         draft_model is None, so target_model is used with output_hidden_states.
     """
+    if draft_model is not None:
+        return generate_draft_tokens_with_cache(
+            target_model=target_model,
+            draft_model=draft_model,
+            input_ids=input_ids,
+            gamma=gamma,
+            adapter=adapter,
+            temperature=temperature,
+        )
+
+    if layer_index is None:
+        raise ValueError("layer_index is required when draft_model is None")
+
     generated = input_ids.clone()
     scores = []
 
     for _ in range(gamma):
-        if draft_model is None:
-            if layer_index is None:
-                raise ValueError("layer_index is required when draft_model is None")
-            logits = draft_next_logits_from_layer(
-                model=target_model,
-                input_ids=generated,
-                layer_index=layer_index,
-                adapter=adapter,
-            )
-        else:
-            logits = draft_next_logits_from_truncated_model(
-                target_model=target_model,
-                draft_model=draft_model,
-                input_ids=generated,
-                adapter=adapter,
-            )
+        logits = draft_next_logits_from_layer(
+            model=target_model,
+            input_ids=generated,
+            layer_index=layer_index,
+            adapter=adapter,
+        )
 
         probs = torch.softmax(logits.float() / temperature, dim=-1)
         next_token = torch.multinomial(probs[0], num_samples=1)
 
         scores.append(logits)
         generated = torch.cat([generated, next_token.view(1, 1)], dim=-1)
+
+    return {
+        "sequences": generated,
+        "scores": scores,
+    }
+
+
+@torch.no_grad()
+def generate_draft_tokens_with_cache(
+    target_model,
+    draft_model,
+    input_ids,
+    gamma=6,
+    adapter=None,
+    temperature=1.0,
+):
+    """
+    Generate draft tokens with the truncated draft model's KV cache.
+
+    Work pattern:
+        prefill once on the full prefix
+        then run one new token at a time with past_key_values
+    """
+    generated = input_ids.clone()
+    scores = []
+
+    attention_mask = torch.ones_like(input_ids, device=input_ids.device)
+
+    outputs = draft_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=True,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+
+    past_key_values = outputs.past_key_values
+    next_h = outputs.hidden_states[-1][:, -1:, :]
+
+    for step in range(gamma):
+        if adapter is not None:
+            adapter_dtype = next(adapter.parameters()).dtype
+            adapted_h = adapter(next_h.to(dtype=adapter_dtype))
+        else:
+            adapted_h = next_h
+
+        target_dtype = next(target_model.parameters()).dtype
+        adapted_h = adapted_h.to(dtype=target_dtype)
+
+        logits = target_model.lm_head(target_model.model.norm(adapted_h))[:, -1, :]
+        scores.append(logits)
+
+        probs = torch.softmax(logits.float() / temperature, dim=-1)
+        next_token = torch.multinomial(probs[0], num_samples=1).view(1, 1)
+
+        generated = torch.cat([generated, next_token], dim=-1)
+
+        if step == gamma - 1:
+            break
+
+        attention_mask = torch.cat(
+            [
+                attention_mask,
+                torch.ones(
+                    (attention_mask.shape[0], 1),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                ),
+            ],
+            dim=-1,
+        )
+
+        outputs = draft_model(
+            input_ids=next_token,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        past_key_values = outputs.past_key_values
+        next_h = outputs.hidden_states[-1][:, -1:, :]
 
     return {
         "sequences": generated,
@@ -243,6 +329,7 @@ def run_speculative_eval(
 
     example_count = 0
     used_truncated_draft = draft_model is not None
+    used_draft_cache = draft_model is not None
 
     transformers.set_seed(42)
 
@@ -407,6 +494,7 @@ def run_speculative_eval(
         "num_prefix_tokens": num_prefix_tokens,
         "num_examples": example_count,
         "used_truncated_draft": used_truncated_draft,
+        "used_draft_cache": used_draft_cache,
         "alpha": float(alpha),
         "mean_speculative_time": float(np.mean(speculative_times)),
         "mean_vanilla_time": float(np.mean(vanilla_times)),
