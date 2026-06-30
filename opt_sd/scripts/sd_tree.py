@@ -145,6 +145,7 @@ class OPTTree:
     expected_acceptance_score: float
     draft_forward_passes: int
     depth_summaries: List[dict]
+    draft_cache_used: bool = False
 
     @property
     def depth(self) -> int:
@@ -190,6 +191,8 @@ class SpeculativeDecodingStats:
             d["mean_tree_depth"] = self.total_tree_depth / self.steps
             d["mean_acceptance_length"] = self.total_generated_tokens / self.steps
             d["mean_accepted_draft_tokens"] = self.total_accepted_draft_tokens / self.steps
+            d["mean_draft_forward_passes"] = self.total_draft_forward_passes / self.steps
+            d["mean_target_forward_passes"] = self.total_target_forward_passes / self.steps
             d["tokens_per_second_wall"] = (
                 self.total_generated_tokens / self.total_wall_time_sec
                 if self.total_wall_time_sec > 0
@@ -200,6 +203,8 @@ class SpeculativeDecodingStats:
             d["mean_tree_depth"] = 0
             d["mean_acceptance_length"] = 0
             d["mean_accepted_draft_tokens"] = 0
+            d["mean_draft_forward_passes"] = 0
+            d["mean_target_forward_passes"] = 0
             d["tokens_per_second_wall"] = None
         return d
 
@@ -330,6 +335,58 @@ def _small_model_next_probs_for_parents(
     return probs
 
 
+@torch.no_grad()
+def _small_model_prefill_for_cached_tree(
+    small_model,
+    all_ids: torch.Tensor,
+    device_type: str,
+):
+    """Run the draft model once on the prefix and keep logits + KV cache."""
+    input_ids = all_ids.to(device_type).unsqueeze(0)
+    attention_mask = torch.ones_like(input_ids, device=device_type)
+
+    out = small_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=True,
+        return_dict=True,
+    )
+
+    return out.logits[:, -1, :], out.past_key_values
+
+
+@torch.no_grad()
+def _small_model_extend_cached_node(
+    small_model,
+    token_id: int,
+    parent_past_key_values,
+    parent_sequence_length: int,
+    device_type: str,
+):
+    """
+    Extend one cached prefix+path by one token and return logits + new cache.
+
+    This avoids rerunning the whole prefix/path for every new draft node. It is
+    still Python-call-heavy, but each call processes only one token.
+    """
+    input_ids = torch.tensor([[token_id]], dtype=torch.long, device=device_type)
+    attention_mask = torch.ones(
+        (1, parent_sequence_length + 1),
+        dtype=torch.long,
+        device=device_type,
+    )
+
+    out = small_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        past_key_values=parent_past_key_values,
+        use_cache=True,
+        return_dict=True,
+    )
+
+    return out.logits[:, -1, :], out.past_key_values
+
+
 def _select_closed_top_nodes(
     all_nodes: List[DraftTreeNode],
     candidate_ids: List[int],
@@ -378,6 +435,7 @@ def construct_opt_tree(
     branch_top_k: Optional[int] = None,
     draft_temperature: float = 1.0,
     device_type: str = "cuda",
+    use_draft_cache: bool = True,
 ) -> OPTTree:
     """
     Build an adaptive draft tree.
@@ -404,23 +462,59 @@ def construct_opt_tree(
     depth_summaries: List[dict] = []
 
     final_selected_ids: List[int] = []
+    prefix_len = int(all_ids.numel())
+
+    root_logits = None
+    root_past_key_values = None
+    cached_logits_by_id: Dict[int, torch.Tensor] = {}
+    cached_past_by_id: Dict[int, object] = {}
+    effective_use_draft_cache = use_draft_cache
+
+    if effective_use_draft_cache:
+        try:
+            root_logits, root_past_key_values = _small_model_prefill_for_cached_tree(
+                small_model=small_model,
+                all_ids=all_ids,
+                device_type=device_type,
+            )
+            draft_forward_passes += 1
+        except Exception:
+            # Some model classes/backends do not expose reusable caches in a way
+            # this simple tree builder can consume. Fall back to the original
+            # batched full-path implementation rather than failing the decode.
+            effective_use_draft_cache = False
 
     for depth in range(1, max_depth + 1):
         if not frontier_parent_ids:
             break
 
-        # Expand the current frontier. Depth 1 expands the root/prefix, later
-        # depths expand the most promising nodes from the previous depth.
-        probs_batch = _small_model_next_probs_for_parents(
-            small_model=small_model,
-            tokenizer=tokenizer,
-            all_ids=all_ids,
-            nodes_by_id=nodes_by_id,
-            parent_ids=frontier_parent_ids,
-            device_type=device_type,
-            draft_temperature=draft_temperature,
-        )
-        draft_forward_passes += 1
+        if effective_use_draft_cache:
+            # Expand the frontier using logits that were produced when each
+            # parent node's cache was materialized. No prefix/path recompute.
+            logits_rows = []
+            for parent_id in frontier_parent_ids:
+                if parent_id == -1:
+                    logits_rows.append(root_logits)
+                else:
+                    logits_rows.append(cached_logits_by_id[parent_id])
+
+            logits_batch = torch.cat(logits_rows, dim=0)
+            probs_batch = _softmax_with_temperature(
+                logits_batch,
+                temperature=draft_temperature,
+            )
+        else:
+            # Original portable path: run full prefix+path sequences as a batch.
+            probs_batch = _small_model_next_probs_for_parents(
+                small_model=small_model,
+                tokenizer=tokenizer,
+                all_ids=all_ids,
+                nodes_by_id=nodes_by_id,
+                parent_ids=frontier_parent_ids,
+                device_type=device_type,
+                draft_temperature=draft_temperature,
+            )
+            draft_forward_passes += 1
 
         new_ids_this_depth: List[int] = []
 
@@ -478,11 +572,40 @@ def construct_opt_tree(
 
         # Expand only high-score nodes from the newest layer, matching the idea
         # that the last layer is the frontier.
-        frontier_parent_ids = sorted(
+        next_frontier_parent_ids = sorted(
             new_ids_this_depth,
             key=lambda idx: all_nodes[idx].path_score,
             reverse=True,
         )[:node_budget]
+
+        if effective_use_draft_cache:
+            next_cached_logits_by_id: Dict[int, torch.Tensor] = {}
+            next_cached_past_by_id: Dict[int, object] = {}
+
+            for node_id in next_frontier_parent_ids:
+                node = nodes_by_id[node_id]
+                if node.parent_id == -1:
+                    parent_past = root_past_key_values
+                    parent_sequence_length = prefix_len
+                else:
+                    parent_past = cached_past_by_id[node.parent_id]
+                    parent_sequence_length = prefix_len + nodes_by_id[node.parent_id].depth
+
+                node_logits, node_past = _small_model_extend_cached_node(
+                    small_model=small_model,
+                    token_id=node.token_id,
+                    parent_past_key_values=parent_past,
+                    parent_sequence_length=parent_sequence_length,
+                    device_type=device_type,
+                )
+                draft_forward_passes += 1
+                next_cached_logits_by_id[node_id] = node_logits
+                next_cached_past_by_id[node_id] = node_past
+
+            cached_logits_by_id = next_cached_logits_by_id
+            cached_past_by_id = next_cached_past_by_id
+
+        frontier_parent_ids = next_frontier_parent_ids
 
     # Re-map selected nodes to dense node ids in topological order. The
     # visualizer and 4D attention builder assume parent ids point backward.
@@ -515,6 +638,7 @@ def construct_opt_tree(
         expected_acceptance_score=expected_acceptance_score,
         draft_forward_passes=draft_forward_passes,
         depth_summaries=depth_summaries,
+        draft_cache_used=effective_use_draft_cache,
     )
 
 
@@ -746,6 +870,7 @@ def verify_tree_and_sample_output(
     do_sample: bool,
     temperature: float,
     device_type: str = "cuda",
+    decode_tokens: bool = True,
 ) -> dict:
     """
     Walk down the draft tree using target-model choices.
@@ -778,7 +903,9 @@ def verify_tree_and_sample_output(
             {
                 "parent_node_id": current_parent,
                 "target_token_id": target_token_id,
-                "target_token_text": tokenizer.decode([target_token_id]),
+                "target_token_text": (
+                    tokenizer.decode([target_token_id]) if decode_tokens else None
+                ),
                 "target_token_probability": target_prob,
                 "hit_draft_child": child is not None,
                 "child_node_id": None if child is None else child.node_id,
@@ -830,13 +957,22 @@ def create_tree_step_log(
     step_tokens: torch.Tensor,
     all_ids_after_step: torch.Tensor,
     wall_time_sec: float,
+    include_tree_nodes: bool = True,
+    decode_text: bool = True,
 ):
     accepted_tokens = verify_info["accepted_tokens"]
     bonus_token = verify_info["bonus_token"]
 
-    accepted_text = tokenizer.decode(accepted_tokens, skip_special_tokens=False)
-    bonus_text = tokenizer.decode(bonus_token, skip_special_tokens=False)
-    step_text = tokenizer.decode(step_tokens, skip_special_tokens=False)
+    if decode_text:
+        accepted_text = tokenizer.decode(accepted_tokens, skip_special_tokens=False)
+        bonus_text = tokenizer.decode(bonus_token, skip_special_tokens=False)
+        step_text = tokenizer.decode(step_tokens, skip_special_tokens=False)
+        full_text_after_step = tokenizer.decode(all_ids_after_step, skip_special_tokens=True)
+    else:
+        accepted_text = None
+        bonus_text = None
+        step_text = None
+        full_text_after_step = None
 
     return {
         "step_index": step_index,
@@ -849,8 +985,9 @@ def create_tree_step_log(
             "threshold": tree.threshold,
             "expected_acceptance_score_sum_path_probs": tree.expected_acceptance_score,
             "draft_forward_passes": tree.draft_forward_passes,
+            "draft_cache_used": tree.draft_cache_used,
             "depth_summaries": tree.depth_summaries,
-            "nodes": [asdict(node) for node in tree.nodes],
+            "nodes": [asdict(node) for node in tree.nodes] if include_tree_nodes else [],
         },
         "target_forward": target_forward_info,
         "verification": {
@@ -866,7 +1003,7 @@ def create_tree_step_log(
             "step_num_tokens": int(step_tokens.numel()),
             "step_text": step_text,
             "total_num_tokens_after_step": int(all_ids_after_step.numel()),
-            "full_text_after_step": tokenizer.decode(all_ids_after_step, skip_special_tokens=True),
+            "full_text_after_step": full_text_after_step,
         },
         "timing": {
             "wall_time_sec": wall_time_sec,
@@ -932,8 +1069,11 @@ def opt_tree_speculative_decoding_step(
     temperature: float = 0.0,
     draft_temperature: float = 1.0,
     prefer_tree_attention: bool = True,
+    use_draft_cache: bool = True,
     remaining_tokens: Optional[int] = None,
     print_logs: bool = True,
+    log_tree_nodes: bool = True,
+    decode_step_text: bool = True,
 ):
     step_start = time.perf_counter()
     all_ids_before_step = all_ids.clone()
@@ -950,6 +1090,7 @@ def opt_tree_speculative_decoding_step(
         branch_top_k=branch_top_k,
         draft_temperature=draft_temperature,
         device_type=device_type,
+        use_draft_cache=use_draft_cache,
     )
 
     # Phase 2: verify. The big model produces next-token logits for the root and
@@ -972,6 +1113,7 @@ def opt_tree_speculative_decoding_step(
         do_sample=do_sample,
         temperature=temperature,
         device_type=device_type,
+        decode_tokens=decode_step_text or print_logs,
     )
 
     accepted_tokens = verify_info["accepted_tokens"]
@@ -994,6 +1136,8 @@ def opt_tree_speculative_decoding_step(
         step_tokens=step_tokens,
         all_ids_after_step=new_all_ids,
         wall_time_sec=wall_time_sec,
+        include_tree_nodes=log_tree_nodes,
+        decode_text=decode_step_text or print_logs,
     )
 
     if print_logs:
@@ -1043,7 +1187,10 @@ def speculative_decode_tree(
     branch_top_k: Optional[int] = None,
     draft_temperature: float = 1.0,
     prefer_tree_attention: bool = True,
+    use_draft_cache: bool = True,
     stop_on_eos: bool = True,
+    log_tree_nodes: bool = True,
+    decode_step_text: bool = True,
 ):
     """
     Drop-in replacement for your previous speculative_decode.
@@ -1084,8 +1231,11 @@ def speculative_decode_tree(
             temperature=temperature,
             draft_temperature=draft_temperature,
             prefer_tree_attention=prefer_tree_attention,
+            use_draft_cache=use_draft_cache,
             remaining_tokens=remaining_tokens,
             print_logs=print_logs,
+            log_tree_nodes=log_tree_nodes,
+            decode_step_text=decode_step_text,
         )
 
         step_log = step_info["step_log"]
@@ -1133,6 +1283,9 @@ def speculative_decode_tree(
         "temperature": temperature,
         "draft_temperature": draft_temperature,
         "prefer_tree_attention": prefer_tree_attention,
+        "use_draft_cache": use_draft_cache,
+        "log_tree_nodes": log_tree_nodes,
+        "decode_step_text": decode_step_text,
         "stats": decoding_stats.to_dict(),
         "steps": all_step_logs,
     }
