@@ -330,14 +330,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=-1)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--max-model-len", type=int, default=None)
-    parser.add_argument("--max-num-seqs", type=int, default=None)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=4096,
+        help="Cap vLLM context length. Qwen3.5 may otherwise resolve to a huge 262k context.",
+    )
+    parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--prompts-file", default=None)
     parser.add_argument("--out", default=None)
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress/result prints; useful from notebooks.",
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--enable-chunked-prefill", action="store_true")
     parser.add_argument("--no-trust-remote-code", action="store_true")
@@ -386,17 +396,19 @@ def main() -> None:
     for mode in modes:
         result = run_vllm_benchmark(config, prompts, mode)
         results[mode] = result
-        print(json.dumps(result, indent=2))
+        if not args.quiet:
+            print(json.dumps(result, indent=2))
 
     results["comparison"] = compare_results(results)
-    if results["comparison"] is not None:
+    if results["comparison"] is not None and not args.quiet:
         print(json.dumps({"comparison": results["comparison"]}, indent=2))
 
     if args.out is not None:
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
-        print(f"Wrote benchmark results to {out_path}")
+        if not args.quiet:
+            print(f"Wrote benchmark results to {out_path}")
 
 
 if __name__ == "__main__":

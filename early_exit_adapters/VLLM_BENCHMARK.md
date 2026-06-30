@@ -32,10 +32,17 @@ python -m early_exit_adapters.vllm_speculative_benchmark \
   --draft-model Qwen/Qwen3.5-0.8B \
   --mode both \
   --num-speculative-tokens 4 \
+  --max-model-len 4096 \
+  --max-num-seqs 4 \
+  --gpu-memory-utilization 0.75 \
   --max-tokens 128 \
   --repeats 3 \
   --out results/vllm_qwen35_2b_08b.json
 ```
+
+The `max_model_len` cap is important for Qwen3.5: vLLM can otherwise resolve
+the model's context length to a very large value, which is not appropriate for a
+small T4 benchmark.
 
 For lower peak memory or cleaner allocator behavior, run the two modes in
 separate processes:
@@ -43,10 +50,12 @@ separate processes:
 ```bash
 python -m early_exit_adapters.vllm_speculative_benchmark \
   --mode target \
+  --max-model-len 4096 \
   --out results/vllm_target_only.json
 
 python -m early_exit_adapters.vllm_speculative_benchmark \
   --mode speculative \
+  --max-model-len 4096 \
   --out results/vllm_small_draft.json
 ```
 
