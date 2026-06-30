@@ -12,6 +12,7 @@ import argparse
 import gc
 import json
 import os
+import traceback
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -312,6 +313,15 @@ def compare_results(results: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _write_results(path: str | None, results: dict[str, Any]) -> None:
+    if path is None:
+        return
+
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark vLLM target-only and draft-model speculative decoding."
@@ -347,6 +357,11 @@ def parse_args() -> argparse.Namespace:
         "--quiet",
         action="store_true",
         help="Suppress progress/result prints; useful from notebooks.",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Write partial results and continue when one benchmark mode fails.",
     )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--enable-chunked-prefill", action="store_true")
@@ -391,24 +406,40 @@ def main() -> None:
         "target": None,
         "speculative": None,
         "comparison": None,
+        "errors": [],
     }
 
     for mode in modes:
-        result = run_vllm_benchmark(config, prompts, mode)
-        results[mode] = result
-        if not args.quiet:
-            print(json.dumps(result, indent=2))
+        try:
+            result = run_vllm_benchmark(config, prompts, mode)
+            results[mode] = result
+            results["comparison"] = compare_results(results)
+            _write_results(args.out, results)
+            if not args.quiet:
+                print(json.dumps(result, indent=2))
+        except Exception as exc:
+            error = {
+                "mode": mode,
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            results["errors"].append(error)
+            results["comparison"] = compare_results(results)
+            _write_results(args.out, results)
+            if not args.quiet:
+                print(json.dumps({"error": error}, indent=2))
+            if not args.continue_on_error:
+                raise
 
     results["comparison"] = compare_results(results)
     if results["comparison"] is not None and not args.quiet:
         print(json.dumps({"comparison": results["comparison"]}, indent=2))
 
     if args.out is not None:
-        out_path = Path(args.out)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        _write_results(args.out, results)
         if not args.quiet:
-            print(f"Wrote benchmark results to {out_path}")
+            print(f"Wrote benchmark results to {args.out}")
 
 
 if __name__ == "__main__":
